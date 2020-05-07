@@ -20,12 +20,16 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
+import com.google.common.collect.Sets;
 import io.airlift.slice.Slice;
 import io.prestosql.Session;
 import io.prestosql.connector.CatalogName;
 import io.prestosql.operator.aggregation.InternalAggregationFunction;
 import io.prestosql.operator.scalar.ScalarFunctionImplementation;
 import io.prestosql.operator.window.WindowFunctionSupplier;
+import io.prestosql.security.AccessControl;
+import io.prestosql.security.AccessControlConfig;
+import io.prestosql.security.AllowAllAccessControl;
 import io.prestosql.spi.PrestoException;
 import io.prestosql.spi.QueryId;
 import io.prestosql.spi.block.ArrayBlockEncoding;
@@ -45,6 +49,7 @@ import io.prestosql.spi.block.SingleMapBlockEncoding;
 import io.prestosql.spi.block.SingleRowBlockEncoding;
 import io.prestosql.spi.block.VariableWidthBlockEncoding;
 import io.prestosql.spi.connector.CatalogSchemaName;
+import io.prestosql.spi.connector.CatalogSchemaTableName;
 import io.prestosql.spi.connector.ColumnHandle;
 import io.prestosql.spi.connector.ColumnMetadata;
 import io.prestosql.spi.connector.ConnectorCapabilities;
@@ -110,6 +115,7 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
@@ -163,6 +169,27 @@ public final class MetadataManager
 
     private final ConcurrentMap<String, BlockEncoding> blockEncodings = new ConcurrentHashMap<>();
     private final ConcurrentMap<QueryId, QueryCatalogs> catalogsByQueryId = new ConcurrentHashMap<>();
+    private final AccessControl accessControl;
+    private final AccessControlConfig accessControlConfig;
+
+    public MetadataManager(
+            FeaturesConfig featuresConfig,
+            SessionPropertyManager sessionPropertyManager,
+            SchemaPropertyManager schemaPropertyManager,
+            TablePropertyManager tablePropertyManager,
+            ColumnPropertyManager columnPropertyManager,
+            AnalyzePropertyManager analyzePropertyManager,
+            TransactionManager transactionManager)
+    {
+        this(featuresConfig,
+                sessionPropertyManager,
+                schemaPropertyManager,
+                tablePropertyManager,
+                columnPropertyManager,
+                analyzePropertyManager,
+                transactionManager,
+                new AllowAllAccessControl(), new AccessControlConfig());
+    }
 
     @Inject
     public MetadataManager(
@@ -172,7 +199,9 @@ public final class MetadataManager
             TablePropertyManager tablePropertyManager,
             ColumnPropertyManager columnPropertyManager,
             AnalyzePropertyManager analyzePropertyManager,
-            TransactionManager transactionManager)
+            TransactionManager transactionManager,
+            AccessControl accessControl,
+            AccessControlConfig accessControlConfig)
     {
         typeRegistry = new TypeRegistry(featuresConfig);
         functions = new FunctionRegistry(this, featuresConfig);
@@ -185,6 +214,8 @@ public final class MetadataManager
         this.columnPropertyManager = requireNonNull(columnPropertyManager, "columnPropertyManager is null");
         this.analyzePropertyManager = requireNonNull(analyzePropertyManager, "analyzePropertyManager is null");
         this.transactionManager = requireNonNull(transactionManager, "transactionManager is null");
+        this.accessControl = accessControl;
+        this.accessControlConfig = accessControlConfig;
 
         // add the built-in BlockEncodings
         addBlockEncoding(new VariableWidthBlockEncoding());
@@ -301,7 +332,6 @@ public final class MetadataManager
     public Optional<TableHandle> getTableHandle(Session session, QualifiedObjectName table)
     {
         requireNonNull(table, "table is null");
-
         Optional<CatalogMetadata> catalog = getOptionalCatalogMetadata(session, table.getCatalogName());
         if (catalog.isPresent()) {
             CatalogMetadata catalogMetadata = catalog.get();
@@ -309,13 +339,24 @@ public final class MetadataManager
             ConnectorMetadata metadata = catalogMetadata.getMetadataFor(catalogName);
 
             ConnectorSession connectorSession = session.toConnectorSession(catalogName);
-            ConnectorTableHandle tableHandle = metadata.getTableHandle(connectorSession, table.asSchemaTableName());
-            if (tableHandle != null) {
-                return Optional.of(new TableHandle(
-                        catalogName,
-                        tableHandle,
+            ConnectorTableHandle connectorTableHandle = metadata.getTableHandle(connectorSession, table.asSchemaTableName());
+            if (connectorTableHandle != null) {
+                TableHandle tableHandle = new TableHandle(catalogName,
+                        connectorTableHandle,
                         catalogMetadata.getTransactionHandleFor(catalogName),
-                        Optional.empty()));
+                        Optional.empty());
+                if (!accessControlConfig.isFilterMetadataEnabled()) {
+                    return Optional.of(tableHandle);
+                }
+                else {
+                    TableMetadata tableMetadata = getTableMetadata(session, tableHandle);
+                    if (!accessControl.filterTables(
+                            session.toSecurityContext(),
+                            catalogName.getCatalogName(),
+                            Sets.newHashSet(tableMetadata.getTable())).isEmpty()) {
+                        return Optional.of(tableHandle);
+                    }
+                }
             }
         }
         return Optional.empty();
@@ -484,7 +525,19 @@ public final class MetadataManager
             throw new PrestoException(NOT_SUPPORTED, "Table has no columns: " + tableHandle);
         }
 
-        return new TableMetadata(catalogName, tableMetadata);
+        CatalogSchemaTableName catalogSchemaTableName = new CatalogSchemaTableName(
+                catalogName.getCatalogName(),
+                tableMetadata.getTable().getSchemaName(),
+                tableMetadata.getTable().getTableName());
+
+        List<ColumnMetadata> columnMetadata = tableMetadata.getColumns();
+        if (accessControlConfig.isFilterMetadataEnabled()) {
+            columnMetadata = accessControl
+                    .filterColumns(session.toSecurityContext(), catalogSchemaTableName, tableMetadata.getColumns());
+        }
+
+        ConnectorTableMetadata filtered = new ConnectorTableMetadata(tableMetadata.getTable(), columnMetadata, tableMetadata.getProperties(), tableMetadata.getComment());
+        return new TableMetadata(catalogName, filtered);
     }
 
     @Override
@@ -502,9 +555,14 @@ public final class MetadataManager
         ConnectorMetadata metadata = getMetadata(session, catalogName);
         Map<String, ColumnHandle> handles = metadata.getColumnHandles(session.toConnectorSession(catalogName), tableHandle.getConnectorHandle());
 
+        TableMetadata tableMetadata = getTableMetadata(session, tableHandle);
+        Set<String> columns = tableMetadata.getColumns().stream().map(cm -> cm.getName()).collect(Collectors.toSet());
+
         ImmutableMap.Builder<String, ColumnHandle> map = ImmutableMap.builder();
         for (Entry<String, ColumnHandle> mapEntry : handles.entrySet()) {
-            map.put(mapEntry.getKey().toLowerCase(ENGLISH), mapEntry.getValue());
+            if (columns.contains(mapEntry.getKey())) {
+                map.put(mapEntry.getKey().toLowerCase(ENGLISH), mapEntry.getValue());
+            }
         }
         return map.build();
     }
@@ -564,7 +622,21 @@ public final class MetadataManager
                 ConnectorMetadata metadata = catalogMetadata.getMetadataFor(catalogName);
 
                 ConnectorSession connectorSession = session.toConnectorSession(catalogName);
-                for (Entry<SchemaTableName, List<ColumnMetadata>> entry : metadata.listTableColumns(connectorSession, tablePrefix).entrySet()) {
+                Map<SchemaTableName, List<ColumnMetadata>> schemaTableNameListMap = metadata.listTableColumns(connectorSession, tablePrefix);
+
+                ImmutableMap.Builder<SchemaTableName, List<ColumnMetadata>> mapBuider = ImmutableMap.builder();
+                if (accessControlConfig.isFilterMetadataEnabled()) {
+                    schemaTableNameListMap.forEach((schemaTableName, columnMetadata) ->
+                            mapBuider.put(schemaTableName,
+                                    accessControl.filterColumns(
+                                            session.toSecurityContext(),
+                                            new CatalogSchemaTableName(catalogMetadata.getCatalogName().getCatalogName(), schemaTableName),
+                                            columnMetadata)));
+                }
+                else {
+                    mapBuider.putAll(schemaTableNameListMap);
+                }
+                for (Entry<SchemaTableName, List<ColumnMetadata>> entry : mapBuider.build().entrySet()) {
                     QualifiedObjectName tableName = new QualifiedObjectName(
                             prefix.getCatalogName(),
                             entry.getKey().getSchemaName(),

@@ -28,6 +28,7 @@ public class AccessControlConfig
 {
     private static final Splitter SPLITTER = Splitter.on(',').trimResults().omitEmptyStrings();
     private List<File> accessControlFiles = ImmutableList.of();
+    private boolean filterMetadata;
 
     @NotNull
     public List<File> getAccessControlFiles()
@@ -41,6 +42,18 @@ public class AccessControlConfig
         this.accessControlFiles = SPLITTER.splitToList(accessControlFiles).stream()
                 .map(File::new)
                 .collect(toImmutableList());
+        return this;
+    }
+
+    public boolean isFilterMetadataEnabled()
+    {
+        return filterMetadata;
+    }
+
+    @Config("access-control.filter-metadata")
+    public AccessControlConfig setFilterMetadataEnabled(boolean enabled)
+    {
+        this.filterMetadata = enabled;
         return this;
     }
 
